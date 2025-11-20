@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Chatbot - Gemini Studio (demo)</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 700px; margin: 2rem auto; padding: 0 1rem; }
+    #status { margin-bottom: .5rem; font-size: .9rem; color: #444 }
+    #chat { border: 1px solid #ddd; padding: 1rem; height: 60vh; overflow: auto; background: #fafafa }
+    .msg { margin: .5rem 0 }
+    .user { text-align: right; color: #0b66ff }
+    .bot { text-align: left; color: #111 }
+    #controls { margin-top: 1rem; display:flex; gap:.5rem }
+    textarea { flex:1; height: 3rem; }
+  </style>
+</head>
+<body>
+  <h1>Chatbot - Gemini Studio (demo)</h1>
+  <div id="status">Estado: cargando...</div>
+  <div id="chat"></div>
+  <div id="controls">
+    <label for="message" style="display:none;">Mensaje</label>
+    <textarea id="message" placeholder="Escribe tu mensaje..."></textarea>
+    <button id="send">Enviar</button>
+  </div>
+  <script src="/static/chat.js"></script>
+</body>
+</html>
