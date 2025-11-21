@@ -44,6 +44,7 @@ def search_in_database(query: str, limit: int = 10) -> List[Dict[str, Any]]:
     """
     Busca información en la base de datos basándose en la consulta del usuario.
     Utiliza búsqueda por palabras clave en todos los campos de texto.
+    Si detecta números, también busca por CAEDEC.
     """
     connection = get_db_connection()
     if not connection:
@@ -53,6 +54,22 @@ def search_in_database(query: str, limit: int = 10) -> List[Dict[str, Any]]:
         with connection.cursor() as cursor:
             # Extraer palabras clave de la consulta
             keywords = query.lower().split()
+
+            # Detectar si hay números (posible CAEDEC)
+            numbers = [k for k in keywords if k.isdigit()]
+
+            # Si hay un número, intentar búsqueda exacta por CAEDEC primero
+            if numbers:
+                for num in numbers:
+                    try:
+                        caedec_value = int(num)
+                        sql = "SELECT * FROM informacion WHERE caedec = %s LIMIT %s"
+                        cursor.execute(sql, (caedec_value, limit))
+                        exact_results = cursor.fetchall()
+                        if exact_results:
+                            return exact_results
+                    except ValueError:
+                        pass
 
             # Construir la consulta SQL con búsqueda LIKE para cada palabra clave
             search_conditions = []
@@ -119,17 +136,21 @@ def format_db_results(results: List[Dict[str, Any]]) -> str:
     return formatted
 
 
-def generate_ai_response_with_context(user_question: str, db_context: str) -> str:
+def generate_ai_response_with_context(user_question: str, db_results: List[Dict[str, Any]]) -> str:
     """
-    Genera una respuesta usando la IA de Gemini con el contexto de la base de datos.
-    La IA está restringida a responder SOLO con la información proporcionada.
+    Genera una respuesta conversacional usando la IA de Gemini con datos de la base de datos.
+    La IA responde de forma natural, pero SOLO con información de la BD.
     """
     gemini_key = os.getenv('GEMINI_API_KEY')
-    gemini_model = os.getenv('GEMINI_MODEL', 'gemini-2.0-flash-exp')
+    gemini_model = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
 
     if not genai or not gemini_key:
-        # Si no hay API disponible, devolver solo el contexto formateado
-        return db_context
+        # Si no hay API disponible, devolver respuesta simple
+        if not db_results:
+            return "No encontré información sobre eso en la base de datos."
+        # Formatear una respuesta básica
+        first = db_results[0]
+        return f"Encontré información sobre {first.get('nombre', 'este registro')}: {first.get('descripcion', 'Sin descripción')}"
 
     try:
         os.environ.setdefault('GEMINI_API_KEY', gemini_key)
@@ -138,25 +159,38 @@ def generate_ai_response_with_context(user_question: str, db_context: str) -> st
         except TypeError:
             client = genai.Client()
 
-        # Crear un prompt muy restrictivo para que la IA solo use la información proporcionada
-        system_prompt = f"""Eres un asistente que SOLO puede responder preguntas usando la información proporcionada de una base de datos.
+        # Preparar los datos en formato estructurado para el prompt
+        db_info = ""
+        for row in db_results:
+            db_info += f"\n- Nombre: {row.get('nombre', 'N/A')}"
+            if row.get('nombreLargo'):
+                db_info += f"\n  Nombre completo: {row.get('nombreLargo')}"
+            if row.get('caedec'):
+                db_info += f"\n  CAEDEC: {row.get('caedec')}"
+            if row.get('descripcion'):
+                db_info += f"\n  Descripción: {row.get('descripcion')}"
+            db_info += "\n"
 
-REGLAS ESTRICTAS:
-1. SOLO puedes usar la información que aparece en el "CONTEXTO DE LA BASE DE DATOS" que se te proporciona a continuación.
-2. Si la pregunta del usuario NO se puede responder con la información disponible, debes decir: "Lo siento, no tengo información sobre eso en mi base de datos."
-3. Si el usuario pregunta sobre temas no relacionados con la información de la base de datos (como el clima, noticias, recetas, programación, etc.), debes decir: "Lo siento, solo puedo responder preguntas relacionadas con la información almacenada en mi base de datos. No tengo permitido ayudarte con otros temas."
-4. NO inventes información.
-5. NO uses conocimiento general que no esté en el contexto proporcionado.
-6. Responde de forma clara, natural y conversacional, usando solo los datos que se te proporcionan.
-7. Si encuentras información relevante, preséntala de manera organizada y fácil de entender.
+        # Prompt optimizado para conversación natural
+        system_prompt = f"""Eres un asistente conversacional que ayuda a los usuarios con información de una base de datos de empresas y actividades económicas.
 
-CONTEXTO DE LA BASE DE DATOS:
-{db_context}
+REGLAS IMPORTANTES:
+1. Responde de forma NATURAL y CONVERSACIONAL, como si fueras un asistente humano amigable.
+2. SOLO usa la información que se te proporciona del contexto de la base de datos a continuación.
+3. NO inventes datos ni uses información externa o conocimiento general.
+4. Si te preguntan sobre temas NO relacionados con la base de datos (clima, fecha actual, noticias, recetas, programación, matemáticas, etc.), responde amablemente: "Lo siento, solo tengo acceso a información de empresas y actividades económicas en mi base de datos. No puedo ayudarte con ese tema debido a las restricciones de la aplicación."
+5. Si NO encuentras información relevante en los datos proporcionados, di: "No encontré información sobre eso en la base de datos."
+6. Responde de forma DIRECTA y CONCISA, sin listar todos los registros a menos que te lo pidan explícitamente.
+7. Si te preguntan por un dato específico (como CAEDEC, descripción, nombre), proporciona SOLO ese dato de forma clara.
+8. Mantén un tono amable y profesional.
+
+DATOS DISPONIBLES DE LA BASE DE DATOS:
+{db_info}
 
 PREGUNTA DEL USUARIO:
 {user_question}
 
-Responde la pregunta usando ÚNICAMENTE la información del contexto anterior. Si no hay información relevante, indícalo claramente."""
+Responde de forma natural y conversacional, usando ÚNICAMENTE la información proporcionada arriba."""
 
         response = client.models.generate_content(
             model=gemini_model,
@@ -166,12 +200,15 @@ Responde la pregunta usando ÚNICAMENTE la información del contexto anterior. S
         if response and hasattr(response, 'text'):
             return response.text
         else:
-            return db_context
+            return "No pude generar una respuesta en este momento."
 
     except Exception as e:
         print(f"Error al generar respuesta con IA: {e}")
-        # En caso de error, devolver el contexto formateado
-        return db_context
+        if not db_results:
+            return "No encontré información sobre eso en la base de datos."
+        # Respuesta de emergencia
+        first = db_results[0]
+        return f"Encontré que {first.get('nombre', 'este registro')} tiene el CAEDEC {first.get('caedec', 'desconocido')}: {first.get('descripcion', 'Sin descripción')}"
 
 
 @app.route('/')
@@ -192,23 +229,24 @@ def chat():
 
     try:
         # Buscar información relevante en la base de datos
-        db_results = search_in_database(message, limit=8)
+        db_results = search_in_database(message, limit=5)
 
         if not db_results:
             return jsonify({
-                'reply': 'Lo siento, no encontré información relevante en la base de datos para responder tu pregunta. Por favor, intenta reformular tu pregunta o pregunta sobre algo que pueda estar en nuestros registros.'
+                'reply': 'Lo siento, no encontré información relevante en la base de datos para responder tu pregunta. Por favor, intenta reformular tu pregunta o pregunta sobre empresas o actividades económicas que puedan estar en nuestros registros.'
             })
 
-        # Formatear los resultados
-        db_context = format_db_results(db_results)
-
-        # Generar respuesta con IA usando el contexto de la base de datos
-        ai_response = generate_ai_response_with_context(message, db_context)
+        # Generar respuesta con IA usando los resultados de la base de datos
+        ai_response = generate_ai_response_with_context(message, db_results)
 
         return jsonify({'reply': ai_response})
 
     except Exception as e:
         print(f"Error en el endpoint /chat: {e}")
+        return jsonify({
+            'error': 'Error al procesar tu pregunta',
+            'detail': str(e)
+        }), 500
         return jsonify({
             'error': 'Error al procesar tu pregunta',
             'detail': str(e)
@@ -219,7 +257,7 @@ def chat():
 def status():
     """Devuelve información de diagnóstico sobre la configuración."""
     gemini_key = os.getenv('GEMINI_API_KEY')
-    gemini_model = os.getenv('GEMINI_MODEL', 'gemini-2.0-flash-exp')
+    gemini_model = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
 
     sdk_installed = genai is not None
     has_key = bool(gemini_key)
@@ -239,7 +277,8 @@ def status():
     except Exception as e:
         print(f"Error verificando base de datos: {e}")
 
-    mode = 'database + ai' if (sdk_installed and has_key and db_connected) else 'database only' if db_connected else 'error'
+    # Determinar el modo: 'sdk' si tiene API key y SDK, sino 'echo'
+    mode = 'sdk' if (sdk_installed and has_key) else 'echo'
 
     return jsonify({
         'sdk_installed': sdk_installed,
