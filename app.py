@@ -1,11 +1,7 @@
 from flask import Flask, render_template, request, jsonify
 import os
-
-# Intentamos importar requests de forma segura
-try:
-    import requests
-except Exception:
-    requests = None
+import pymysql
+from typing import List, Dict, Any
 
 # Intentamos importar el SDK oficial de Google GenAI si está instalado
 try:
@@ -16,13 +12,166 @@ except Exception:
 try:
     from dotenv import load_dotenv
 except Exception:
-    # Definimos un stub si python-dotenv no está disponible
     def load_dotenv(*args, **kwargs):
         return
 
 load_dotenv()
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
+
+# Configuración de la base de datos MySQL
+DB_CONFIG = {
+    'host': os.getenv('DB_HOST', 'localhost'),
+    'user': os.getenv('DB_USER', 'root'),
+    'password': os.getenv('DB_PASSWORD', ''),
+    'database': os.getenv('DB_NAME', 'chatai'),
+    'charset': 'utf8mb4',
+    'cursorclass': pymysql.cursors.DictCursor
+}
+
+
+def get_db_connection():
+    """Obtiene una conexión a la base de datos MySQL."""
+    try:
+        connection = pymysql.connect(**DB_CONFIG)
+        return connection
+    except Exception as e:
+        print(f"Error conectando a la base de datos: {e}")
+        return None
+
+
+def search_in_database(query: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    Busca información en la base de datos basándose en la consulta del usuario.
+    Utiliza búsqueda por palabras clave en todos los campos de texto.
+    """
+    connection = get_db_connection()
+    if not connection:
+        return []
+
+    try:
+        with connection.cursor() as cursor:
+            # Extraer palabras clave de la consulta
+            keywords = query.lower().split()
+
+            # Construir la consulta SQL con búsqueda LIKE para cada palabra clave
+            search_conditions = []
+            params = []
+
+            for keyword in keywords:
+                if len(keyword) > 2:  # Ignorar palabras muy cortas
+                    search_param = f"%{keyword}%"
+                    search_conditions.append(
+                        "(nombre LIKE %s OR nombreLargo LIKE %s OR descripcion LIKE %s)"
+                    )
+                    params.extend([search_param, search_param, search_param])
+
+            if not search_conditions:
+                # Si no hay palabras clave válidas, devolver registros aleatorios
+                sql = "SELECT * FROM informacion ORDER BY RAND() LIMIT %s"
+                cursor.execute(sql, (limit,))
+            else:
+                # Buscar registros que coincidan con las palabras clave
+                sql = f"""
+                    SELECT *, 
+                    (
+                        (CASE WHEN nombre LIKE %s THEN 3 ELSE 0 END) +
+                        (CASE WHEN nombreLargo LIKE %s THEN 2 ELSE 0 END) +
+                        (CASE WHEN descripcion LIKE %s THEN 1 ELSE 0 END)
+                    ) as relevancia
+                    FROM informacion
+                    WHERE {' OR '.join(search_conditions)}
+                    ORDER BY relevancia DESC
+                    LIMIT %s
+                """
+                # Agregar parámetros para el cálculo de relevancia
+                first_keyword = f"%{keywords[0]}%" if keywords else "%%"
+                relevance_params = [first_keyword, first_keyword, first_keyword]
+                cursor.execute(sql, relevance_params + params + [limit])
+
+            results = cursor.fetchall()
+            return results
+    except Exception as e:
+        print(f"Error buscando en la base de datos: {e}")
+        return []
+    finally:
+        connection.close()
+
+
+def format_db_results(results: List[Dict[str, Any]]) -> str:
+    """Formatea los resultados de la base de datos en un texto legible."""
+    if not results:
+        return "No se encontró información relevante en la base de datos."
+
+    formatted = "Información encontrada en la base de datos:\n\n"
+    for i, row in enumerate(results, 1):
+        formatted += f"{i}. "
+        if row.get('nombre'):
+            formatted += f"Nombre: {row['nombre']}"
+        if row.get('nombreLargo'):
+            formatted += f" ({row['nombreLargo']})"
+        if row.get('caedec'):
+            formatted += f" - CAEDEC: {row['caedec']}"
+        if row.get('descripcion'):
+            formatted += f"\n   Descripción: {row['descripcion']}"
+        formatted += "\n\n"
+
+    return formatted
+
+
+def generate_ai_response_with_context(user_question: str, db_context: str) -> str:
+    """
+    Genera una respuesta usando la IA de Gemini con el contexto de la base de datos.
+    La IA está restringida a responder SOLO con la información proporcionada.
+    """
+    gemini_key = os.getenv('GEMINI_API_KEY')
+    gemini_model = os.getenv('GEMINI_MODEL', 'gemini-2.0-flash-exp')
+
+    if not genai or not gemini_key:
+        # Si no hay API disponible, devolver solo el contexto formateado
+        return db_context
+
+    try:
+        os.environ.setdefault('GEMINI_API_KEY', gemini_key)
+        try:
+            client = genai.Client(api_key=gemini_key)
+        except TypeError:
+            client = genai.Client()
+
+        # Crear un prompt muy restrictivo para que la IA solo use la información proporcionada
+        system_prompt = f"""Eres un asistente que SOLO puede responder preguntas usando la información proporcionada de una base de datos.
+
+REGLAS ESTRICTAS:
+1. SOLO puedes usar la información que aparece en el "CONTEXTO DE LA BASE DE DATOS" que se te proporciona a continuación.
+2. Si la pregunta del usuario NO se puede responder con la información disponible, debes decir: "Lo siento, no tengo información sobre eso en mi base de datos."
+3. Si el usuario pregunta sobre temas no relacionados con la información de la base de datos (como el clima, noticias, recetas, programación, etc.), debes decir: "Lo siento, solo puedo responder preguntas relacionadas con la información almacenada en mi base de datos. No tengo permitido ayudarte con otros temas."
+4. NO inventes información.
+5. NO uses conocimiento general que no esté en el contexto proporcionado.
+6. Responde de forma clara, natural y conversacional, usando solo los datos que se te proporcionan.
+7. Si encuentras información relevante, preséntala de manera organizada y fácil de entender.
+
+CONTEXTO DE LA BASE DE DATOS:
+{db_context}
+
+PREGUNTA DEL USUARIO:
+{user_question}
+
+Responde la pregunta usando ÚNICAMENTE la información del contexto anterior. Si no hay información relevante, indícalo claramente."""
+
+        response = client.models.generate_content(
+            model=gemini_model,
+            contents=system_prompt
+        )
+
+        if response and hasattr(response, 'text'):
+            return response.text
+        else:
+            return db_context
+
+    except Exception as e:
+        print(f"Error al generar respuesta con IA: {e}")
+        # En caso de error, devolver el contexto formateado
+        return db_context
 
 
 @app.route('/')
@@ -32,250 +181,111 @@ def index():
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    """Recibe JSON {"message": "..."} y devuelve {"reply": "..."}.
-
-    Lógica:
-    - Si está disponible el SDK `genai` y hay `GEMINI_API_KEY`, usar el SDK (no necesita URL).
-    - Si no, si hay `GEMINI_API_URL` y `GEMINI_API_KEY`, usar requests para llamar al endpoint (soporta key en query o header).
-    - Si no hay credenciales/url, usar fallback local (Echo).
+    """
+    Recibe una pregunta del usuario y responde usando SOLO información de la base de datos.
     """
     data = request.get_json() or {}
     message = data.get('message', '').strip()
+
     if not message:
-        return jsonify({'error': 'No message provided'}), 400
+        return jsonify({'error': 'No se proporcionó ningún mensaje'}), 400
 
-    gemini_url = os.getenv('GEMINI_API_URL')
-    gemini_key = os.getenv('GEMINI_API_KEY')
-    gemini_model = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+    try:
+        # Buscar información relevante en la base de datos
+        db_results = search_in_database(message, limit=8)
 
-    def local_fallback_reply(message: str) -> str:
-        """Genera una respuesta local simple (reglas heurísticas) cuando la API externa no está disponible.
+        if not db_results:
+            return jsonify({
+                'reply': 'Lo siento, no encontré información relevante en la base de datos para responder tu pregunta. Por favor, intenta reformular tu pregunta o pregunta sobre algo que pueda estar en nuestros registros.'
+            })
 
-        Esto mejora la UX temporalmente mientras se resuelve la cuota.
-        """
-        m = message.lower()
-        if any(g in m for g in ['hola', 'buenas', 'buenos']):
-            return '¡Hola! Puedo responder preguntas simples, resumir texto y darte ideas. (Respuesta local en modo offline)'
-        if 'que puedes' in m or 'qué puedes' in m or 'puedes hacer' in m:
-            return 'Puedo responder preguntas generales, explicar conceptos, y ayudarte a escribir código. Para respuestas más completas usa una API con cuota disponible.'
-        if any(q in m for q in ['?', 'cómo', 'como', 'por qué', 'qué', 'quién', 'cuando', 'cuándo']):
-            return 'Lo siento, ahora no puedo acceder al modelo remoto por límites de cuota; de todos modos puedo dar una respuesta breve: intenta preguntar de nuevo o pide aumento de cuota en Google Cloud.'
-        # default
-        return f"Lo siento, no puedo acceder al modelo remoto en este momento. (Respuesta local): {message}"
+        # Formatear los resultados
+        db_context = format_db_results(db_results)
 
-    # 1) Intentar usar SDK oficial si está presente y hay API key
-    if genai is not None and gemini_key:
-        try:
-            # Asegurarnos de que el SDK pueda leer la key desde env si lo necesita
-            os.environ.setdefault('GEMINI_API_KEY', gemini_key)
-            try:
-                client = genai.Client(api_key=gemini_key)
-            except TypeError:
-                # versiones antiguas del SDK pueden no aceptar api_key como arg
-                client = genai.Client()
+        # Generar respuesta con IA usando el contexto de la base de datos
+        ai_response = generate_ai_response_with_context(message, db_context)
 
-            # Intentar con reintentos suaves si hay fallos temporales (no para cuota 0)
-            max_retries = 2
-            backoff = 1
-            last_exc = None
-            response = None
-            for attempt in range(max_retries + 1):
-                try:
-                    response = client.models.generate_content(model=gemini_model, contents=message)
-                    break
-                except Exception as e:
-                    last_exc = e
-                    serr = str(e)
-                    # Si detectamos cuota explícita con valor 0, no reintentamos
-                    if 'quota_limit_value' in serr and "'0'" in serr:
-                        break
-                    # Si es claramente quota exhausted, no insistir mucho
-                    if 'RESOURCE_EXHAUSTED' in serr or 'Quota exceeded' in serr or 'quota' in serr.lower():
-                        # fallamos rápido
-                        break
-                    if attempt < max_retries:
-                        import time
-                        time.sleep(backoff)
-                        backoff *= 2
-                        continue
-                    else:
-                        break
+        return jsonify({'reply': ai_response})
 
-            if response is None:
-                # No se obtuvo respuesta válida
-                serr = str(last_exc) if last_exc is not None else 'Unknown error'
-                # Detectar si es error de cuota para devolver status 429 y link útil
-                if 'RESOURCE_EXHAUSTED' in serr or 'Quota exceeded' in serr or 'quota' in serr.lower():
-                    help_url = 'https://cloud.google.com/docs/quotas/help/request_increase'
-                    # intentar extraer project id si aparece en el mensaje
-                    import re
-                    m = re.search(r"projects/(\d+)", serr)
-                    consumer_project = m.group(1) if m else None
-                    return jsonify({
-                        'error': 'Quota exceeded',
-                        'detail': serr,
-                        'consumer_project': consumer_project,
-                        'help': f'Request more quota at {help_url}',
-                        'quota_action': 'request_increase',
-                        'fallback_reply': local_fallback_reply(message)
-                    }), 429
-                return jsonify({'error': 'Error contacting Gemini via SDK', 'detail': serr, 'fallback_reply': local_fallback_reply(message)}), 500
-
-            # El SDK expone la respuesta en response.text según la doc
-            # response está garantizado a no ser None aquí por el if anterior
-            if response is not None:
-                reply = getattr(response, 'text', None)
-                if not reply:
-                    # Fallback: intentar representar el objeto
-                    reply = str(response)
-                return jsonify({'reply': reply})
-            else:
-                return jsonify({'error': 'No response from SDK', 'fallback_reply': local_fallback_reply(message)}), 500
-        except Exception as e:
-            # Manejo final por si surge alguna excepción no prevista
-            serr = str(e)
-            if 'RESOURCE_EXHAUSTED' in serr or 'Quota exceeded' in serr or 'quota' in serr.lower():
-                help_url = 'https://cloud.google.com/docs/quotas/help/request_increase'
-                return jsonify({
-                    'error': 'Quota exceeded',
-                    'detail': serr,
-                    'help': f'Request more quota at {help_url}',
-                    'quota_action': 'request_increase',
-                    'fallback_reply': local_fallback_reply(message)
-                }), 429
-            return jsonify({'error': 'Error contacting Gemini via SDK', 'detail': serr, 'fallback_reply': local_fallback_reply(message)}), 500
-
-    # 2) Si no hay SDK, intentar usar requests con GEMINI_API_URL + GEMINI_API_KEY
-    if gemini_url and gemini_key:
-        if requests is None:
-            return jsonify({'error': 'Server misconfigured: requests library not installed. Run `pip install requests`'}), 500
-        try:
-            headers = {
-                'Content-Type': 'application/json'
-            }
-
-            # Opción para usar la key como query param
-            use_key_in_query = os.getenv('GEMINI_USE_KEY_IN_QUERY', '0') in ['1', 'true', 'True']
-            url = gemini_url
-            if use_key_in_query:
-                if 'key=' not in url:
-                    sep = '&' if '?' in url else '?'
-                    url = f"{url}{sep}key={gemini_key}"
-            else:
-                headers['Authorization'] = f'Bearer {gemini_key}'
-
-            payload = {
-                'prompt': message
-            }
-            resp = requests.post(url, headers=headers, json=payload, timeout=20)
-            resp.raise_for_status()
-            j = None
-            try:
-                j = resp.json()
-            except Exception:
-                # no json
-                pass
-
-            reply = None
-            if j is not None and isinstance(j, dict):
-                if 'candidates' in j and isinstance(j.get('candidates'), list) and j['candidates']:
-                    candidates = j['candidates']
-                    first = candidates[0]
-                    if isinstance(first, dict):
-                        reply = first.get('content') or first.get('message') or None
-                if not reply and 'output' in j:
-                    reply = j.get('output')
-                if not reply and 'reply' in j:
-                    reply = j.get('reply')
-                if not reply and 'choices' in j and isinstance(j.get('choices'), list) and j['choices']:
-                    choices = j['choices']
-                    ch = choices[0]
-                    if isinstance(ch, dict):
-                        msg = ch.get('message')
-                        if isinstance(msg, dict):
-                            reply = msg.get('content')
-                        reply = reply or ch.get('text')
-            if not reply:
-                reply = resp.text
-
-            return jsonify({'reply': reply})
-        except Exception as e:
-            return jsonify({'error': 'Error contacting Gemini API', 'detail': str(e)}), 500
-
-    # 3) Fallback local
-    fallback = local_fallback_reply(message)
-    return jsonify({'reply': fallback})
+    except Exception as e:
+        print(f"Error en el endpoint /chat: {e}")
+        return jsonify({
+            'error': 'Error al procesar tu pregunta',
+            'detail': str(e)
+        }), 500
 
 
 @app.route('/status')
 def status():
-    """Devuelve información de diagnóstico sobre la configuración (no expone la clave)."""
-    gemini_url = os.getenv('GEMINI_API_URL')
+    """Devuelve información de diagnóstico sobre la configuración."""
     gemini_key = os.getenv('GEMINI_API_KEY')
-    gemini_model = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+    gemini_model = os.getenv('GEMINI_MODEL', 'gemini-2.0-flash-exp')
 
     sdk_installed = genai is not None
     has_key = bool(gemini_key)
-    mode = 'echo'
-    if sdk_installed and has_key:
-        mode = 'sdk'
-    elif gemini_url and has_key:
-        mode = 'rest'
+
+    # Verificar conexión a la base de datos
+    db_connected = False
+    db_records = 0
+    try:
+        connection = get_db_connection()
+        if connection:
+            db_connected = True
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT COUNT(*) as count FROM informacion")
+                result = cursor.fetchone()
+                db_records = result['count'] if result else 0
+            connection.close()
+    except Exception as e:
+        print(f"Error verificando base de datos: {e}")
+
+    mode = 'database + ai' if (sdk_installed and has_key and db_connected) else 'database only' if db_connected else 'error'
 
     return jsonify({
         'sdk_installed': sdk_installed,
         'has_key': has_key,
         'gemini_model': gemini_model,
-        'gemini_url_set': bool(gemini_url),
+        'db_connected': db_connected,
+        'db_records': db_records,
         'mode': mode
     })
 
 
-@app.route('/debug/set_key', methods=['POST'])
-def debug_set_key():
-    """Establece GEMINI_API_KEY en tiempo de ejecución (solo localhost). Útil para pruebas locales sin reiniciar.
-
-    POST JSON: {"api_key": "..."}
-    """
-    # Aceptar solo peticiones desde localhost para mayor seguridad
-    remote = request.remote_addr or ''
-    if not (remote.startswith('127.') or remote == '::1' or remote == 'localhost'):
-        return jsonify({'error': 'forbidden', 'detail': 'only allowed from localhost'}), 403
-
-    data = request.get_json() or {}
-    api_key = data.get('api_key')
-    if not api_key:
-        return jsonify({'error': 'no api_key provided'}), 400
-
-    os.environ['GEMINI_API_KEY'] = api_key
-    # reload dotenv if present (no-op if not)
+@app.route('/test_db')
+def test_db():
+    """Endpoint de prueba para verificar la conexión a la base de datos."""
     try:
-        from dotenv import load_dotenv
-        load_dotenv(override=True)
-    except Exception:
-        pass
+        connection = get_db_connection()
+        if not connection:
+            return jsonify({'error': 'No se pudo conectar a la base de datos'}), 500
 
-    return jsonify({'status': 'ok', 'gemini_key_set': True})
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) as count FROM informacion")
+            result = cursor.fetchone()
+            count = result['count'] if result else 0
+
+            cursor.execute("SELECT * FROM informacion LIMIT 3")
+            samples = cursor.fetchall()
+
+        connection.close()
+
+        return jsonify({
+            'status': 'connected',
+            'total_records': count,
+            'sample_records': samples
+        })
+    except Exception as e:
+        return jsonify({
+            'error': 'Error al conectar con la base de datos',
+            'detail': str(e)
+        }), 500
 
 
-@app.route('/debug/clear_key', methods=['POST'])
-def debug_clear_key():
-    """Elimina GEMINI_API_KEY en tiempo de ejecución (solo localhost)."""
-    remote = request.remote_addr or ''
-    if not (remote.startswith('127.') or remote == '::1' or remote == 'localhost'):
-        return jsonify({'error': 'forbidden', 'detail': 'only allowed from localhost'}), 403
-
-    os.environ.pop('GEMINI_API_KEY', None)
-    try:
-        from dotenv import load_dotenv
-        load_dotenv(override=True)
-    except Exception:
-        pass
-    return jsonify({'status': 'ok', 'gemini_key_set': False})
-
-
-# Print minimal startup diagnostics (no key value)
-print('__STARTUP__: SDK_installed=' + str(genai is not None) + ", GEMINI_API_URL_set=" + str(bool(os.getenv('GEMINI_API_URL'))) + ", GEMINI_API_KEY_set=" + str(bool(os.getenv('GEMINI_API_KEY'))))
+# Print minimal startup diagnostics
+print('__STARTUP__: SDK_installed=' + str(genai is not None) +
+      ", GEMINI_API_KEY_set=" + str(bool(os.getenv('GEMINI_API_KEY'))) +
+      ", DB_configured=" + str(DB_CONFIG['database']))
 
 if __name__ == '__main__':
     app.run(host='127.0.0.1', port=5000, debug=True)
+
