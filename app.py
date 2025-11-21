@@ -57,59 +57,92 @@ def search_in_database(query: str, limit: int = 10) -> List[Dict[str, Any]]:
 
             # Detectar si hay números (posible CAEDEC)
             numbers = [k for k in keywords if k.isdigit()]
+            text_keywords = [k for k in keywords if len(k) >= 2 and not k.isdigit()]
 
-            # Si hay un número, intentar búsqueda exacta por CAEDEC primero
+            # Si hay números, buscar por CAEDEC exacto primero
+            if numbers and not text_keywords:
+                caedec_conditions = []
+                caedec_params = []
+                for num in numbers:
+                    try:
+                        caedec_value = int(num)
+                        caedec_conditions.append("caedec = %s")
+                        caedec_params.append(caedec_value)
+                    except ValueError:
+                        pass
+
+                if caedec_conditions:
+                    sql = f"SELECT * FROM informacion WHERE {' OR '.join(caedec_conditions)} LIMIT %s"
+                    cursor.execute(sql, caedec_params + [limit])
+                    return cursor.fetchall()
+
+            # Construir búsqueda por texto
+            if not text_keywords and not numbers:
+                # Si no hay palabras clave válidas, devolver registros aleatorios
+                sql = "SELECT * FROM informacion ORDER BY RAND() LIMIT %s"
+                cursor.execute(sql, (limit,))
+                return cursor.fetchall()
+
+            # Construir cálculo de relevancia dinámico y condiciones de búsqueda
+            relevance_parts = []
+            search_conditions = []
+            all_params = []
+            relevance_params = []
+
+            # Procesar palabras de texto
+            for keyword in text_keywords:
+                search_param = f"%{keyword}%"
+
+                # Condición de búsqueda (OR)
+                search_conditions.append(
+                    "(nombre LIKE %s OR nombreLargo LIKE %s OR descripcion LIKE %s)"
+                )
+                all_params.extend([search_param, search_param, search_param])
+
+                # Puntuación por relevancia (usando parámetros)
+                relevance_parts.append("(CASE WHEN nombre LIKE %s THEN 3 ELSE 0 END)")
+                relevance_parts.append("(CASE WHEN nombreLargo LIKE %s THEN 2 ELSE 0 END)")
+                relevance_parts.append("(CASE WHEN descripcion LIKE %s THEN 1 ELSE 0 END)")
+                relevance_params.extend([search_param, search_param, search_param])
+
+            # Procesar números (CAEDEC)
             if numbers:
                 for num in numbers:
                     try:
                         caedec_value = int(num)
-                        sql = "SELECT * FROM informacion WHERE caedec = %s LIMIT %s"
-                        cursor.execute(sql, (caedec_value, limit))
-                        exact_results = cursor.fetchall()
-                        if exact_results:
-                            return exact_results
+                        search_conditions.append("caedec = %s")
+                        all_params.append(caedec_value)
+                        relevance_parts.append("(CASE WHEN caedec = %s THEN 10 ELSE 0 END)")
+                        relevance_params.append(caedec_value)
                     except ValueError:
                         pass
 
-            # Construir la consulta SQL con búsqueda LIKE para cada palabra clave
-            search_conditions = []
-            params = []
-
-            for keyword in keywords:
-                if len(keyword) > 2:  # Ignorar palabras muy cortas
-                    search_param = f"%{keyword}%"
-                    search_conditions.append(
-                        "(nombre LIKE %s OR nombreLargo LIKE %s OR descripcion LIKE %s)"
-                    )
-                    params.extend([search_param, search_param, search_param])
-
             if not search_conditions:
-                # Si no hay palabras clave válidas, devolver registros aleatorios
                 sql = "SELECT * FROM informacion ORDER BY RAND() LIMIT %s"
                 cursor.execute(sql, (limit,))
-            else:
-                # Buscar registros que coincidan con las palabras clave
-                sql = f"""
-                    SELECT *, 
-                    (
-                        (CASE WHEN nombre LIKE %s THEN 3 ELSE 0 END) +
-                        (CASE WHEN nombreLargo LIKE %s THEN 2 ELSE 0 END) +
-                        (CASE WHEN descripcion LIKE %s THEN 1 ELSE 0 END)
-                    ) as relevancia
-                    FROM informacion
-                    WHERE {' OR '.join(search_conditions)}
-                    ORDER BY relevancia DESC
-                    LIMIT %s
-                """
-                # Agregar parámetros para el cálculo de relevancia
-                first_keyword = f"%{keywords[0]}%" if keywords else "%%"
-                relevance_params = [first_keyword, first_keyword, first_keyword]
-                cursor.execute(sql, relevance_params + params + [limit])
+                return cursor.fetchall()
 
+            relevance_sql = " + ".join(relevance_parts)
+
+            sql = f"""
+                SELECT *, 
+                ({relevance_sql}) as relevancia
+                FROM informacion
+                WHERE {' OR '.join(search_conditions)}
+                ORDER BY relevancia DESC
+                LIMIT %s
+            """
+
+            # Combinar todos los parámetros: relevancia + búsqueda + limit
+            final_params = relevance_params + all_params + [limit]
+            cursor.execute(sql, final_params)
             results = cursor.fetchall()
             return results
+
     except Exception as e:
         print(f"Error buscando en la base de datos: {e}")
+        import traceback
+        traceback.print_exc()
         return []
     finally:
         connection.close()
