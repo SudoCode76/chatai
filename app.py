@@ -19,7 +19,6 @@ load_dotenv()
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
 
-# Configuración de la base de datos MySQL
 DB_CONFIG = {
     'host': os.getenv('DB_HOST', 'localhost'),
     'user': os.getenv('DB_USER', 'root'),
@@ -31,7 +30,6 @@ DB_CONFIG = {
 
 
 def get_db_connection():
-    """Obtiene una conexión a la base de datos MySQL."""
     try:
         connection = pymysql.connect(**DB_CONFIG)
         return connection
@@ -41,23 +39,35 @@ def get_db_connection():
 
 
 def search_in_database(query: str, limit: int = 10) -> List[Dict[str, Any]]:
-    """
-    Busca información en la base de datos basándose en la consulta del usuario.
-    Utiliza búsqueda por palabras clave en todos los campos de texto.
-    Si detecta números, también busca por CAEDEC.
-    """
+
     connection = get_db_connection()
     if not connection:
         return []
 
+    STOP_WORDS = {
+        'el', 'la', 'de', 'del', 'los', 'las', 'un', 'una', 'unos', 'unas',
+        'es', 'son', 'esta', 'este', 'esa', 'ese', 'cual', 'que', 'quien',
+        'como', 'donde', 'cuando', 'por', 'para', 'con', 'sin', 'sobre',
+        'en', 'al', 'a', 'y', 'o', 'pero', 'si', 'no', 'me', 'te', 'se',
+        'cual', 'cuales', 'cuanto', 'cuantos', 'tiene', 'tienen', 'hay',
+        'eres', 'soy', 'somos', 'tengo', 'tienes', 'ser', 'estar',
+        'empresa', 'empresas', 'empresarial', 'empresariales',
+        'compania', 'compañia', 'companias', 'compañias',
+        'sociedad', 'sociedades', 'sa', 'srl', 'ltda',
+        'informacion', 'información', 'datos', 'dato',
+        'caedec', 'caeded', 'codigo', 'código', 'numero', 'número',
+        'nombre', 'llamada', 'llama', 'llamado', 'llamados'
+    }
+
     try:
         with connection.cursor() as cursor:
-            # Extraer palabras clave de la consulta
-            keywords = query.lower().split()
+            # Extraer palabras clave de la consulta y convertir a mayúsculas
+            keywords = query.upper().split()
 
             # Detectar si hay números (posible CAEDEC)
             numbers = [k for k in keywords if k.isdigit()]
-            text_keywords = [k for k in keywords if len(k) >= 2 and not k.isdigit()]
+            # Filtrar palabras de texto: longitud >= 2, no números, no stop words
+            text_keywords = [k for k in keywords if len(k) >= 2 and not k.isdigit() and k.lower() not in STOP_WORDS]
 
             # Si hay números, buscar por CAEDEC exacto primero
             if numbers and not text_keywords:
@@ -84,6 +94,7 @@ def search_in_database(query: str, limit: int = 10) -> List[Dict[str, Any]]:
                 return cursor.fetchall()
 
             # Construir cálculo de relevancia dinámico y condiciones de búsqueda
+            # Usar UPPER() para hacer la búsqueda case-insensitive
             relevance_parts = []
             search_conditions = []
             all_params = []
@@ -93,16 +104,16 @@ def search_in_database(query: str, limit: int = 10) -> List[Dict[str, Any]]:
             for keyword in text_keywords:
                 search_param = f"%{keyword}%"
 
-                # Condición de búsqueda (OR)
+                # Condición de búsqueda (OR) - case-insensitive usando UPPER()
                 search_conditions.append(
-                    "(nombre LIKE %s OR nombreLargo LIKE %s OR descripcion LIKE %s)"
+                    "(UPPER(nombre) LIKE %s OR UPPER(nombreLargo) LIKE %s OR UPPER(descripcion) LIKE %s)"
                 )
                 all_params.extend([search_param, search_param, search_param])
 
-                # Puntuación por relevancia (usando parámetros)
-                relevance_parts.append("(CASE WHEN nombre LIKE %s THEN 3 ELSE 0 END)")
-                relevance_parts.append("(CASE WHEN nombreLargo LIKE %s THEN 2 ELSE 0 END)")
-                relevance_parts.append("(CASE WHEN descripcion LIKE %s THEN 1 ELSE 0 END)")
+                # Puntuación por relevancia (usando parámetros) - case-insensitive
+                relevance_parts.append("(CASE WHEN UPPER(nombre) LIKE %s THEN 3 ELSE 0 END)")
+                relevance_parts.append("(CASE WHEN UPPER(nombreLargo) LIKE %s THEN 2 ELSE 0 END)")
+                relevance_parts.append("(CASE WHEN UPPER(descripcion) LIKE %s THEN 1 ELSE 0 END)")
                 relevance_params.extend([search_param, search_param, search_param])
 
             # Procesar números (CAEDEC)
